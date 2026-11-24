@@ -1,8 +1,6 @@
 # Harness
 
-A minimal **terminal REPL** that drives a remote or local **Cursor-compatible Responses API** and closes the loop by running real shell commands on your machine. The model only gets one tool — `run_bash` — so every filesystem or command-line action goes through a single, auditable path.
-
-Typical setup: run **CursorProxyCli** (or any server that implements `POST /v1/responses` like OpenAI’s Responses shape), point this harness at it, and chat from `user> ` while the assistant inspects your project via bash.
+Terminal **REPL** that talks to a **Responses-compatible API** (`POST /v1/responses`) and runs real shell commands on your machine via a single tool — `run_bash`. Typical default: **Ollama** on `http://127.0.0.1:11434` with a model that supports tools (e.g. `llama3.1:8b`). You can point the same client at **CursorProxyCli** or any compatible proxy.
 
 ---
 
@@ -10,11 +8,13 @@ Typical setup: run **CursorProxyCli** (or any server that implements `POST /v1/r
 
 | Goal | How harness helps |
 |------|-------------------|
-| Test a local LLM proxy without the full Cursor IDE | Same API + tool protocol, plain Python + stdlib |
-| Scriptable “agent in the terminal” | Multi-turn history; tool outputs are fed back until the model stops calling tools |
-| Windows-friendly command execution | Prefer Git Bash over `cmd`; configurable `BASH_PATH` |
+| Local LLM agent with tools | Ollama (or proxy) + `run_bash` loop |
+| Auditable CLI work | Every action is a logged bash command + JSON result in history |
+| Windows-friendly execution | Git Bash (`bash -lc`) when available; optional `BASH_PATH` |
+| Long sessions | Optional persisted history + LLM compaction (`harness_history.py`) |
+| Safer / steadier small models | Harness nudges, path guards, plan/execution discipline (`harness.txt` + Python guards) |
 
-This is **not** a production agent framework: no plugins, no sandbox, no parallel tools. It is a small reference implementation (~150 lines) meant for learning and hacking on the proxy ↔ client contract.
+This is still a **small** codebase (not a full agent framework): one tool, no sandbox, no plugins. Guardrails are prompt + lightweight checks in Python, not a policy engine.
 
 ---
 
@@ -25,49 +25,50 @@ sequenceDiagram
     participant User
     participant Harness as harness.py
     participant API as Responses API
-    participant Shell as bash / cmd
+    participant Shell as Git Bash
 
-    User->>Harness: text (user>)
-    Harness->>API: POST input + tools + instructions
-    API-->>Harness: output[] (messages + function_call)
+    User->>Harness: user> message
+    Harness->>API: POST instructions + tools + input (history)
+    API-->>Harness: output[] (SSE or JSON)
     alt function_call run_bash
-        Harness->>Shell: command
+        Harness->>Harness: guards (plan, paths, placeholders)
+        Harness->>Shell: bash -lc command
         Shell-->>Harness: stdout, stderr, returncode
-        Harness->>API: append function_call_output
-        API-->>Harness: next turn
-    else no more calls
-        Harness-->>User: assistant>
+        Harness->>Harness: append function_call_output, auto-continue/nudges
+        Harness->>API: next turn (same user request)
+    else no more calls / done
+        Harness-->>User: assistant text
+        Harness->>Harness: save session, maybe compact history
     end
 ```
 
-**Components:**
+**Modules:**
 
-1. **`harness.py`** — Loads `.env`, maintains conversation `history`, calls the API in a loop until there are no pending `function_call` items.
-2. **Upstream API** — Expected at `LLM_API` (default `http://127.0.0.1:8765/v1/responses`). Payload includes `model`, `instructions` (system prompt), `tools`, and `input` (prior turns + tool results).
-3. **`run_bash` implementation** — Runs the model’s command locally and returns JSON: `{ command, returncode, stdout, stderr }`.
+| File | Role |
+|------|------|
+| `harness.py` | REPL, API client (stream + non-stream), agent loop, tool runner, guardrails, auto-continue |
+| `harness.txt` | System instructions (loaded each API call; not a duplicate paste-only doc) |
+| `harness_history.py` | Session JSON, turn metrics, optional LLM compaction of old turns |
+| `harness_history.txt` | Prompt used when compacting history |
+| `harness_status.py` | `[status]` lines on stderr (LLM wait, tool run, history budget) |
 
-The published **CursorProxyCli** folder (`net8.0-windows`) is one possible server that listens on that port and forwards to Cursor’s agent runtime; this harness is the **client** side of that experiment.
+User sample data (e.g. PDFs under `faturas/`) is **not** part of the harness; keep it gitignored as needed.
 
 ---
 
-## Agent loop (detailed)
+## Agent loop (per user message)
 
-For each user line:
+1. Append `{ role: user, content }` to `history`.
+2. **Inner `chat()` loop** until the model stops calling tools and the harness accepts the turn as complete:
+   - `POST` full `history` + `instructions` from `harness.txt` + `run_bash` tool schema.
+   - Supports **SSE streaming** when `LLM_STREAM=1` (live stdout/stderr from commands while they run).
+   - Execute each `function_call` → `run_bash`; scrape JSON tool plans from assistant text if the model forgot formal tool calls.
+   - **Auto-continue**: inject `[harness] …` user messages to keep going after failures, missing plans, batch jobs, “Pending: …” without tools, etc. (cap: `HARNESS_MAX_AUTO_CONTINUE`).
+   - Optional **plan gate** (`HARNESS_REQUIRE_PLAN`): first publish a plan in assistant text, then execute (see `harness.txt`).
+   - Optional **scope verify** (`HARNESS_SCOPE_VERIFY`) before finishing a turn.
+3. After the turn: persist session (`harness_history`), maybe compact, print history usage on stderr.
 
-1. Append a user message to `history`.
-2. **Inner loop (`chat`)**:
-   - `POST` the full `history` to the Responses endpoint.
-   - Append the response’s `output` array to `history` (model messages and tool calls in API-native form).
-   - Collect every item with `type == "function_call"`.
-   - If there are **no** function calls, extract assistant text from `output` messages (`output_text` parts), print `assistant> …`, and return to the `user> ` prompt.
-   - For **each** function call:
-     - Parse `arguments` JSON and read `command`.
-     - Print `$ <command>` for transparency.
-     - Run `run(command)` and print stdout/stderr to the terminal.
-     - Append `{ type: "function_call_output", call_id, output }` where `output` is the JSON string from `run`.
-   - Repeat the inner loop so the model can chain multiple commands before answering.
-
-The system prompt (also mirrored in `harness.txt`) tells the model to always use `run_bash` for inspection, never fake command output, respect return codes, and ask before destructive operations unless the user already asked.
+**Chained shell** (`mkdir -p x; for f in …; done`) is allowed in **one** `run_bash` — the whole string is passed to `bash -lc`. Failures are usually wrong commands or model quoting, not a “one command per call” limit.
 
 ---
 
@@ -75,101 +76,112 @@ The system prompt (also mirrored in `harness.txt`) tells the model to always use
 
 | Aspect | Behavior |
 |--------|----------|
-| Schema | OpenAI-style function tool, `strict: true`, single required field `command` (string) |
-| Timeout | 60 seconds per command |
-| Output cap | Last **8000** characters of stdout and stderr each (avoids blowing the context window) |
-| Unix | `shell=True`, executable `/bin/bash` |
-| Windows | If Git Bash (or `BASH_PATH`) is found and is **not** WSL/system `bash.exe`, runs `bash -lc "<command>"`; otherwise falls back to `cmd` via `shell=True` |
-| WSL guard | Skips paths like `system32\bash.exe` and `WindowsApps` so you don’t accidentally hit the wrong bash |
+| Schema | OpenAI-style function, `strict: true`, field `command` (string) |
+| Timeout | **60s** per invocation |
+| Output cap | Last **8000** chars of stdout and stderr each in the JSON returned to the model |
+| Unix | `shell=True`, `executable=/bin/bash` |
+| Windows | `["bash", "-lc", command]` when Git Bash is found (not WSL store bash); else `shell=True` |
+| Guards (examples) | Placeholder paths; plan text in bash; unknown **input** paths vs recent `ls` (outputs like `pdftotext` `.txt` targets are allowed); duplicate success same turn; optional plan-before-first-tool |
 
-Tool results are **only** what `run` returns; the human also sees raw stream output in the console.
-
----
-
-## API client (`api()`)
-
-- Uses **stdlib only**: `urllib.request` + `json` (no `openai` package).
-- `Content-Type: application/json`.
-- If `OPENAI_API_KEY` is set in the environment, sends `Authorization: Bearer …` (useful if your proxy expects a key).
-- On HTTP error, prints the response body and exits.
-
-Request shape (simplified):
-
-```json
-{
-  "model": "composer-2.5",
-  "instructions": "<SYSTEM prompt>",
-  "tools": [ { "type": "function", "name": "run_bash", ... } ],
-  "input": [ ... prior turns, function_call, function_call_output ... ]
-}
-```
-
-The harness assumes the response includes an `output` list compatible with Cursor/OpenAI Responses (message items with `output_text`, and `function_call` items with `call_id` and `arguments`).
+Tool results are JSON: `{ "command", "returncode", "stdout", "stderr" }`.
 
 ---
 
-## Configuration
+## API client
 
-Create or edit `.env` in this directory (loaded on startup via `load_env()`; does not override variables already set in the shell):
+- **Stdlib only** (`urllib`, `json`).
+- Optional `Authorization: Bearer` if `OPENAI_API_KEY` is set.
+- Default endpoint: **Ollama** `http://127.0.0.1:11434/v1/responses` (not the old `8765` Cursor proxy default).
+- `ensure_model_support()` warns if the model lacks `tools` in Ollama tags.
+- Streaming: Server-Sent Events; `harness_status` reports wait/generation milestones.
+
+---
+
+## Configuration (`.env`)
+
+Loaded at startup; does not override variables already set in the shell.
+
+### LLM
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `LLM_API` | `http://127.0.0.1:8765/v1/responses` | Responses endpoint URL |
-| `LLM_MODEL` | `composer-2.5` | `model` field in each request |
-| `OPENAI_API_KEY` | (unset) | Optional bearer token for the proxy |
-| `BASH_PATH` | (auto) | Full path to `bash.exe` on Windows |
+| `LLM_API` | `http://127.0.0.1:11434/v1/responses` | Responses URL |
+| `LLM_MODEL` | `llama3.1:8b` | Model name (must support tools on Ollama) |
+| `LLM_STREAM` | `1` | `0`/`false` = non-streaming API + bulk print of assistant text |
+| `OPENAI_API_KEY` | (unset) | Optional bearer for proxies that require it |
+| `BASH_PATH` | (auto) | Path to Git `bash.exe` on Windows |
 
-`load_env` ignores blank lines, `#` comments, and supports quoted values.
+### Harness behavior
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HARNESS_MAX_AUTO_CONTINUE` | `16` | Max inner-loop nudges per user message |
+| `HARNESS_REQUIRE_PLAN` | `1` | Require a written plan before first `run_bash` (set `0` to disable) |
+| `HARNESS_SCOPE_VERIFY` | `1` | Final self-check nudge before returning to `user>` |
+| `HARNESS_STATUS` | `1` | `[status]` lines on stderr |
+
+### Session history
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HARNESS_HISTORY_ENABLED` | `1` | Persist conversation under `.harness_state/` |
+| `HARNESS_HISTORY_FILE` | `.harness_state/session.json` | Session path |
+| `HARNESS_HISTORY_COMPACT_EVERY` | `6` | Compact after N user turns |
+| `HARNESS_HISTORY_MAX_CHARS` | `48000` | Soft budget before compaction |
+| `HARNESS_HISTORY_KEEP_USER_TURNS` | `4` | Recent user turns kept verbatim when compacting |
 
 ---
 
 ## Requirements
 
-- **Python 3** (developed with 3.14; uses only stdlib)
-- **Optional:** [Git for Windows](https://git-scm.com/) for a sane `run_bash` experience on Windows
-- A running **Responses API** listener (e.g. **CursorProxyCli.exe** on port `8765`)
+- **Python 3** (e.g. 3.14); stdlib only for the harness itself
+- **Ollama** (or another `/v1/responses` server) with a tool-capable model
+- **Git Bash** on Windows (recommended for `pdftotext`, loops, Unix paths)
+- Optional: `poppler` / `pdftotext` on `PATH` for PDF tasks
 
 ---
 
 ## Usage
 
-1. Start your proxy (example: run `CursorProxyCli.exe` from the publish folder).
-2. Configure `.env` if the default URL or model is wrong.
+1. Start Ollama (or your proxy) and pull a model with tools, e.g. `ollama pull llama3.1:8b`.
+2. Copy or edit `.env` (see above).
 3. From this directory:
 
 ```bash
 python harness.py
 ```
 
-4. Type at `user> `. End with Ctrl+D (EOF) or close stdin to quit.
+4. Type at `user> `. Empty lines are ignored. EOF (Ctrl+D) exits.
 
-Example session flow: you ask to list files → model emits `run_bash` → you see `$ ls …` and command output → model may call again → finally `assistant>` with a summary.
+Session resumes from `.harness_state/session.json` when history is enabled.
 
 ---
 
-## Files in this repo
+## Repo layout (harness code)
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `harness.py` | REPL, API client, tool runner, agent loop |
-| `harness.txt` | Copy of the system prompt (documentation / paste into other clients) |
-| `.env` | Local secrets and URLs (keep out of version control) |
-| `README.md` | This document |
+| `harness.py` | Main entrypoint |
+| `harness.txt` | Agent system prompt |
+| `harness_history.py` / `harness_history.txt` | Persistence + compaction |
+| `harness_status.py` | Progress logging |
+| `.gitignore` | `.env`, `.harness_state/`, `.harness_tmp/`, `__pycache__/`, local data dirs |
+| `README.md` | This file |
 
 ---
 
 ## Security and limitations
 
-- Commands run **as your user** with no sandbox. The model can read, modify, or delete anything your shell can. Use only with trusted models and on machines you’re willing to expose.
-- There is no allowlist of commands, no working-directory jail, and no confirmation UI — only the system prompt’s “ask before destructive commands.”
-- Long command output is truncated; the model may miss details beyond the last 8k characters per stream.
-- Single-threaded: one command at a time per turn batch.
-- Network errors and non-JSON failures terminate the process (`SystemExit` on HTTP errors).
+- Commands run **as your user**, no sandbox.
+- Guardrails reduce common model mistakes (invented paths, fake “done”, plan loops); they do **not** replace judgment — treat untrusted models as unsafe.
+- 60s timeout and 8k truncation can hide detail from the model.
+- One command string per `run_bash` invocation (but that string may contain `;`, `&&`, loops).
+- HTTP errors exit the process (`SystemExit`).
 
-For production-style agents, you would add sandboxing, policy hooks, logging, and a richer tool surface; this repo intentionally stops at the smallest working loop.
+For production-style agents you would add policy, sandboxing, and richer tools; this repo stays a minimal, hackable loop.
 
 ---
 
 ## Related: CursorProxyCli
 
-The sibling publish layout under `Documents\net8.0-windows\net8.0-windows` contains **CursorProxyCli** — a .NET 8 Windows build that exposes the HTTP API this harness calls. Together they form a **proxy + CLI client** pair for experimenting with “Cursor agent mode” outside the editor. This harness does not embed Cursor; it only speaks HTTP to whatever implements `/v1/responses`.
+A **.NET** publish of **CursorProxyCli** can expose the same HTTP shape on port `8765`; set `LLM_API` and `LLM_MODEL` accordingly. The harness is only an HTTP client — it does not bundle Cursor or Ollama.
