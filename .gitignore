@@ -1,0 +1,5 @@
+.harness_state/
+.harness_tmp/
+__pycache__/
+.env
+faturas/
